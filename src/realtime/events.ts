@@ -123,12 +123,125 @@ OPERATIONAL RULES FOR YOUR OUTPUT:
 `.trim();
 
 /**
+ * Voice Activity Detection configuration.
+ *
+ * IMPORTANT: the provider schema (`components.schemas.TurnDetection` in
+ * docs.boson.ai/asyncapi.json) declares `additionalProperties: false` and allows
+ * ONLY `type`, `threshold`, `prefix_padding_ms`, `silence_duration_ms` and
+ * `min_speech_duration`. OpenAI-style keys such as `create_response` or
+ * `interrupt_response` are NOT part of this protocol: sending them makes the
+ * `session.update` fail and the session be closed, so they are rejected here.
+ *
+ * Provider defaults: threshold 0.85, prefix_padding_ms 300,
+ * silence_duration_ms 500, min_speech_duration 0.125.
+ */
+export interface VadConfig {
+  type: 'server_vad';
+  threshold: number;
+  prefix_padding_ms: number;
+  silence_duration_ms: number;
+  min_speech_duration: number;
+}
+
+/**
+ * Tuned endpointing values actually used in production today. `threshold: 0.5`
+ * is more sensitive than the 0.85 provider default (quiet prospect audio on a
+ * laptop mic still trips VAD), and 350 ms is more aggressive than the 500 ms
+ * provider default to cut end-of-turn dead air. Both are retained deliberately:
+ * `test/vad-ab.ts` exists to compare 650/550/500 ms fairly on a real session
+ * before any of these numbers is changed.
+ */
+export const DEFAULT_VAD_CONFIG: VadConfig = {
+  type: 'server_vad',
+  threshold: 0.5,
+  prefix_padding_ms: 300,
+  silence_duration_ms: 350,
+  min_speech_duration: 0.125,
+};
+
+/** Every field the provider accepts inside `audio.input.turn_detection`. */
+export const VAD_ALLOWED_FIELDS = [
+  'type',
+  'threshold',
+  'prefix_padding_ms',
+  'silence_duration_ms',
+  'min_speech_duration',
+] as const;
+
+/** Field names that look plausible but are not in the protocol. */
+const VAD_FORBIDDEN_FIELDS = ['create_response', 'interrupt_response', 'idle_timeout_ms'];
+
+function clampNumber(
+  value: unknown,
+  min: number,
+  max: number,
+  fallback: number,
+  name: string
+): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new TypeError(`VAD field "${name}" must be a finite number, received: ${String(value)}`);
+  }
+  return Math.min(max, Math.max(min, value));
+}
+
+/**
+ * Builds a validated, whitelisted `turn_detection` object.
+ * Throws on unknown/forbidden keys instead of silently degrading the session.
+ */
+export function buildTurnDetection(overrides: Partial<VadConfig> = {}): Record<string, unknown> {
+  for (const key of Object.keys(overrides)) {
+    if (VAD_FORBIDDEN_FIELDS.includes(key)) {
+      throw new Error(
+        `turn_detection.${key} is not part of the Boson Higgs Realtime protocol ` +
+          '(TurnDetection declares additionalProperties: false); it would close the session.'
+      );
+    }
+    if (!(VAD_ALLOWED_FIELDS as readonly string[]).includes(key)) {
+      throw new Error(`Unknown turn_detection field: ${key}`);
+    }
+  }
+
+  // Emit only whitelisted keys, in the provider's documented order.
+  return {
+    type: 'server_vad' as const,
+    threshold: clampNumber(overrides.threshold, 0, 1, DEFAULT_VAD_CONFIG.threshold, 'threshold'),
+    prefix_padding_ms: clampNumber(
+      overrides.prefix_padding_ms,
+      0,
+      5000,
+      DEFAULT_VAD_CONFIG.prefix_padding_ms,
+      'prefix_padding_ms'
+    ),
+    silence_duration_ms: clampNumber(
+      overrides.silence_duration_ms,
+      0,
+      5000,
+      DEFAULT_VAD_CONFIG.silence_duration_ms,
+      'silence_duration_ms'
+    ),
+    min_speech_duration: clampNumber(
+      overrides.min_speech_duration,
+      0,
+      10,
+      DEFAULT_VAD_CONFIG.min_speech_duration,
+      'min_speech_duration'
+    ),
+  };
+}
+
+/**
  * Builds the initial session.update event.
  * CRITICAL MODALITY REQUIREMENT:
  * Enforces output_modalities: ["text"]. Zero assistant audio is generated.
  * Configures server_vad and speech transcription for customer microphone streaming.
+ * With server VAD the provider creates the response itself after
+ * `input_audio_buffer.speech_stopped`, so no per-turn response.create is sent.
  */
-export function buildSessionConfig(instructions?: string): ClientEvent {
+export function buildSessionConfig(
+  instructions?: string,
+  vadOverrides: Partial<VadConfig> = {}
+): ClientEvent {
   return {
     type: 'session.update',
     session: {
@@ -139,18 +252,14 @@ export function buildSessionConfig(instructions?: string): ClientEvent {
       audio: {
         input: {
           format: { type: 'audio/pcm', rate: 24000 },
-          turn_detection: {
-            type: 'server_vad',
-            threshold: 0.5,
-            prefix_padding_ms: 300,
-            silence_duration_ms: 350,
-          },
+          turn_detection: buildTurnDetection(vadOverrides),
           transcription: { model: 'higgs-stt-3.1', language: 'en' },
         },
       },
     },
   };
 }
+
 
 /**
  * Creates a user text conversation item event.
@@ -174,6 +283,8 @@ export function userTextItem(text: string): ClientEvent {
 /**
  * Triggers response generation for the current conversation state.
  * Must be sent following conversation.item.create for typed turns.
+ * Never needed for microphone turns: server VAD creates the response itself
+ * ("Server VAD detected the end of user speech; a response follows automatically").
  */
 export function responseCreate(): ClientEvent {
   return {
@@ -182,7 +293,18 @@ export function responseCreate(): ClientEvent {
 }
 
 /**
- * Streams one ~100ms chunk of customer microphone audio: base64-encoded 24kHz PCM16.
+ * Cancels the in-flight response. The cancelled response finishes with
+ * `response.done` (status: "cancelled").
+ */
+export function responseCancel(): ClientEvent {
+  return {
+    type: 'response.cancel',
+  };
+}
+
+/**
+ * Streams one 50 ms chunk of customer microphone audio: base64-encoded 24 kHz PCM16.
+ * The provider accepts up to 1,048,576 base64 bytes (~15 s of 24 kHz PCM16) per append.
  */
 export function inputAudioAppend(base64: string): ClientEvent {
   return {

@@ -15,8 +15,12 @@ import type {
   ConversationMessage,
   EphemeralTokenInfo,
   LogEntry,
+  MicHealth,
   MicState,
 } from './realtime/types';
+
+/** Mic level drives a 60fps-ish meter; 10 Hz is visually identical and 6x cheaper. */
+const MIC_LEVEL_EMIT_INTERVAL_MS = 100;
 
 export default function App() {
   const [status, setStatus] = useState<ConnectionStatus>('disconnected');
@@ -36,10 +40,14 @@ export default function App() {
 
   // Stage 2: Microphone and VAD state
   const [micState, setMicState] = useState<MicState>('idle');
+  const [micHealth, setMicHealth] = useState<MicHealth | null>(null);
   const [micLevel, setMicLevel] = useState<number>(0);
   const [isCustomerSpeaking, setIsCustomerSpeaking] = useState<boolean>(false);
 
   const clientRef = useRef<RealtimeClient | null>(null);
+  const lastMicLevelEmitRef = useRef<number>(0);
+  /** Assistant message ids whose first paint has already been reported. */
+  const reportedRenderRef = useRef<Set<string>>(new Set());
 
   // Fetch backend status
   const fetchBackendStatus = async () => {
@@ -123,11 +131,22 @@ export default function App() {
       onTokenMinted: (token) => {
         setTokenInfo(token);
       },
-      onMicStateChange: (newMicState) => {
+      onMicStateChange: (newMicState, detail) => {
         setMicState(newMicState);
+        if (detail && (newMicState === 'error' || newMicState === 'denied' || newMicState === 'unavailable' || newMicState === 'disconnected')) {
+          setBannerError(detail);
+        }
+      },
+      onMicHealth: (health) => {
+        setMicHealth(health);
       },
       onMicLevel: (rms) => {
-        setMicLevel(rms);
+        const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+        // Always flush a zero level so the meter drops immediately when the mic closes.
+        if (rms === 0 || now - lastMicLevelEmitRef.current >= MIC_LEVEL_EMIT_INTERVAL_MS) {
+          lastMicLevelEmitRef.current = now;
+          setMicLevel((prev) => (prev === rms ? prev : rms));
+        }
       },
       onCustomerSpeaking: (speaking, itemId, speechDurationMs) => {
         setIsCustomerSpeaking(speaking);
@@ -160,6 +179,33 @@ export default function App() {
       client.disconnect();
     };
   }, []);
+
+  /**
+   * Reports the real paint time of the first streamed assistant text.
+   * Two chained rAFs guarantee the frame containing the delta has been painted
+   * before we timestamp it, so "first text rendered" is measured, not assumed.
+   */
+  useEffect(() => {
+    const client = clientRef.current;
+    if (!client) return;
+
+    const pending = messages.find(
+      (m) => m.role === 'assistant' && m.text.length > 0 && !reportedRenderRef.current.has(m.id)
+    );
+    if (!pending) return;
+
+    const msgId = pending.id;
+    // No cleanup that cancels the frame: `messages` changes on every streamed
+    // delta, and cancelling here would repeatedly abort the very paint we want to
+    // timestamp. Duplicate scheduling is harmless (markFirstRender is idempotent).
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        reportedRenderRef.current.add(msgId);
+        if (reportedRenderRef.current.size > 300) reportedRenderRef.current.clear();
+        clientRef.current?.markFirstRender(msgId);
+      });
+    });
+  }, [messages]);
 
   const handleConnect = async () => {
     setBannerError(null);
@@ -262,6 +308,7 @@ export default function App() {
       {/* Stage 2 Customer Microphone Control & Audio Level Meter */}
       <MicControlBar
         micState={micState}
+        micHealth={micHealth}
         micLevel={micLevel}
         isCustomerSpeaking={isCustomerSpeaking}
         isConnected={status === 'connected'}
@@ -290,7 +337,7 @@ export default function App() {
         messages={messages}
         onSelectPrompt={handleSendMessage}
         isConnected={status === 'connected'}
-        isMicActive={micState === 'recording'}
+        isMicActive={micState === 'recording' || micState === 'muted'}
         onStartMic={handleStartMic}
       />
 

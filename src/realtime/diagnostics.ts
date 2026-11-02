@@ -1,4 +1,4 @@
-import type { CloseInfo, LogEntry, ClientTelemetry, TurnTimingDiagnostic } from './types';
+import type { CloseInfo, LogEntry, ClientTelemetry, MicHealth, TurnTimingDiagnostic } from './types';
 
 export interface ExtendedDiagnosticsData {
   sessionId?: string;
@@ -7,6 +7,11 @@ export interface ExtendedDiagnosticsData {
   completedTurns: number;
   reconnectAttempts: number;
   micState: string;
+  /** Live microphone health (frame flow, device label, drops). */
+  micHealth?: MicHealth;
+  /** Capture frames discarded because the socket was not writable. */
+  audioFramesDropped?: number;
+
   isResponseStreaming: boolean;
   closeInfo: CloseInfo | null;
   telemetry: ClientTelemetry | null;
@@ -34,9 +39,21 @@ export interface ExtendedDiagnosticsData {
     responseCreatedToFirstDeltaMs?: number;
     firstDeltaToFirstRenderMs?: number;
     speechEndToFirstVisibleTextMs?: number;
+    /** Speech end -> first delta actually painted (real render measurement). */
+    speechEndToFirstRenderMs?: number;
     firstDeltaToFinalTextMs?: number;
   };
   turnHistory?: TurnTimingDiagnostic[];
+}
+
+/** Nearest-rank percentile over a sorted-in-place copy. Returns undefined for empty input. */
+export function percentile(values: number[], p: number): number | undefined {
+  const clean = values.filter((v) => typeof v === 'number' && Number.isFinite(v)).sort((a, b) => a - b);
+  if (clean.length === 0) return undefined;
+  const clamped = Math.min(100, Math.max(0, p));
+  const rank = Math.ceil((clamped / 100) * clean.length);
+  const index = Math.min(clean.length - 1, Math.max(0, rank - 1));
+  return clean[index];
 }
 
 /**
@@ -148,9 +165,16 @@ Connection Uptime at Closure: ${uptimeSec}s
 
   report += `=== AUDIO AND VAD ===
 Audio Append Count: ${telemetry?.audioAppendCount ?? 0}
-Audio Chunk Rate: ${chunkRate} chunks/sec (~100ms frames)
+Audio Chunk Rate: ${chunkRate} chunks/sec (~50 ms frames)
 Last Audio Append Timestamp: ${telemetry && telemetry.lastAudioAppendTimestamp > 0 ? new Date(telemetry.lastAudioAppendTimestamp).toISOString() : 'N/A'}
 Audio Configuration: 24000 Hz, mono PCM16, turn_detection: server_vad
+Microphone State: ${data.micHealth?.state ?? data.micState}
+Microphone Device: ${data.micHealth?.deviceLabel || 'N/A'}
+Microphone Frames Received: ${data.micHealth?.frameCount ?? 0}
+Microphone Frames Dropped (socket not writable): ${data.audioFramesDropped ?? data.micHealth?.framesDropped ?? 0}
+Microphone Audio Flowing: ${data.micHealth ? (data.micHealth.flowing ? 'yes' : 'NO — no frame within the freshness window') : 'N/A'}
+Microphone Last Frame: ${data.micHealth && data.micHealth.lastFrameAt > 0 ? new Date(data.micHealth.lastFrameAt).toISOString() : 'never'}
+Microphone Detail: ${data.micHealth?.detail || 'none'}
 Speech Started Events: ${data.speechStartedCount}
 Speech Stopped Events: ${data.speechStoppedCount}
 Speech Committed Events: ${data.speechCommittedCount}
@@ -179,23 +203,46 @@ Latest Turn Metrics:
 - Speech Committed → Transcription Completed: ${lm.committedToTranscriptionMs !== undefined ? `${lm.committedToTranscriptionMs} ms` : 'N/A'}
 - Speech End → Response Created: ${lm.speechEndToResponseCreatedMs !== undefined ? `${lm.speechEndToResponseCreatedMs} ms` : 'N/A'}
 - Response Created → First Text Delta: ${lm.responseCreatedToFirstDeltaMs !== undefined ? `${lm.responseCreatedToFirstDeltaMs} ms` : 'N/A'}
-- First Delta → UI Render: ${lm.firstDeltaToFirstRenderMs !== undefined ? `${lm.firstDeltaToFirstRenderMs} ms` : 'N/A'}
-- Speech End → First Visible Text (Total Latency): ${lm.speechEndToFirstVisibleTextMs !== undefined ? `${lm.speechEndToFirstVisibleTextMs} ms` : 'N/A'}
+- First Delta → UI Render (measured): ${lm.firstDeltaToFirstRenderMs !== undefined ? `${lm.firstDeltaToFirstRenderMs} ms` : 'N/A'}
+- Speech End → First Text Received: ${lm.speechEndToFirstVisibleTextMs !== undefined ? `${lm.speechEndToFirstVisibleTextMs} ms` : 'N/A'}
+- Speech End → First Text Rendered (measured total): ${lm.speechEndToFirstRenderMs !== undefined ? `${lm.speechEndToFirstRenderMs} ms` : 'N/A'}
 - First Delta → Final Text: ${lm.firstDeltaToFinalTextMs !== undefined ? `${lm.firstDeltaToFinalTextMs} ms` : 'N/A'}
-`;
+
+NOTE: All client-side timings start at input_audio_buffer.speech_stopped.
+The VAD silence window that precedes it (configured silence_duration_ms, plus the
+prefix padding) is additional perceived latency and is NOT measurable client-side.
+`
 
   if (data.turnHistory && data.turnHistory.length > 0) {
-    const validTtft = data.turnHistory
-      .map((t) => t.speechEndToFirstVisibleTextMs)
-      .filter((v): v is number => typeof v === 'number' && !isNaN(v));
-    const avgTtft = validTtft.length > 0 ? Math.round(validTtft.reduce((a, b) => a + b, 0) / validTtft.length) : 'N/A';
-    const minTtft = validTtft.length > 0 ? Math.min(...validTtft) : 'N/A';
-    const maxTtft = validTtft.length > 0 ? Math.max(...validTtft) : 'N/A';
+    // Prefer the measured render metric; fall back to delta-receipt only when the
+    // UI never reported a paint (e.g. headless run).
+    const renderSeries = data.turnHistory
+      .map((t) => t.speechEndToFirstRenderMs ?? t.speechEndToFirstVisibleTextMs)
+      .filter((v): v is number => typeof v === 'number' && Number.isFinite(v));
+
+    const median = percentile(renderSeries, 50);
+    const p95 = percentile(renderSeries, 95);
+    const minTtft = percentile(renderSeries, 0);
+    const maxTtft = percentile(renderSeries, 100);
+
+    const slowestCounts = new Map<string, number>();
+    for (const t of data.turnHistory) {
+      if (!t.slowestStage) continue;
+      slowestCounts.set(t.slowestStage, (slowestCounts.get(t.slowestStage) || 0) + 1);
+    }
+    const slowestLeader = [...slowestCounts.entries()].sort((a, b) => b[1] - a[1])[0];
+    const turnsWithoutSpeechStopped = Math.max(0, data.speechStartedCount - data.speechStoppedCount);
+
+    const fmt = (v: number | undefined, unit = ' ms') => (v === undefined ? 'N/A' : `${v}${unit}`);
 
     report += `\nMulti-Turn History Summary (${data.turnHistory.length} turns recorded):
-- Average Speech-End-to-First-Token: ${typeof avgTtft === 'number' ? `${avgTtft} ms` : avgTtft}
-- Fastest First-Token: ${typeof minTtft === 'number' ? `${minTtft} ms` : minTtft}
-- Slowest First-Token: ${typeof maxTtft === 'number' ? `${maxTtft} ms` : maxTtft}
+- Samples with a latency value: ${renderSeries.length}
+- Median Speech-End-to-First-Text: ${fmt(median)}
+- p95 Speech-End-to-First-Text: ${fmt(p95)}
+- Minimum: ${fmt(minTtft)}
+- Maximum: ${fmt(maxTtft)}
+- Turns without input_audio_buffer.speech_stopped: ${turnsWithoutSpeechStopped}
+- Most frequent slowest stage: ${slowestLeader ? `${slowestLeader[0]} (${slowestLeader[1]} turns)` : 'N/A'}
 
 Recent Turn Logs:
 `;
@@ -203,8 +250,9 @@ Recent Turn Logs:
     for (const t of recent) {
       const durStr = t.speechDurationMs !== undefined ? `${(t.speechDurationMs / 1000).toFixed(1)}s` : 'N/A';
       const ttftStr = t.speechEndToFirstVisibleTextMs !== undefined ? `${t.speechEndToFirstVisibleTextMs} ms` : 'N/A';
+      const renderStr = t.speechEndToFirstRenderMs !== undefined ? `${t.speechEndToFirstRenderMs} ms` : 'N/A';
       const sttStr = t.committedToTranscriptionMs !== undefined ? `${t.committedToTranscriptionMs} ms` : 'N/A';
-      report += `  • Turn ${t.turnId}: Speech Duration=${durStr}, TTFT=${ttftStr}, STT Latency=${sttStr}, Status=${t.status}\n`;
+      report += `  • Turn ${t.turnId}: Speech Duration=${durStr}, FirstText=${ttftStr}, FirstRender=${renderStr}, STT Latency=${sttStr}, Slowest=${t.slowestStage || 'N/A'}, Status=${t.status}\n`;
     }
   }
 

@@ -42,7 +42,36 @@ export interface CloseInfo {
   telemetry?: ClientTelemetry;
 }
 
-export type MicState = 'idle' | 'requesting' | 'recording' | 'error';
+export type MicState =
+  | 'idle'
+  | 'requesting'
+  | 'recording'
+  | 'muted'
+  | 'denied'
+  | 'unavailable'
+  | 'disconnected'
+  | 'error';
+
+/**
+ * Live microphone health. `flowing` is the only trustworthy signal that audio is
+ * actually reaching the provider: it is driven by frames arriving from the
+ * AudioWorklet, not by the intent to record.
+ */
+export interface MicHealth {
+  state: MicState;
+  /** Human-readable reason for non-recording states. */
+  detail?: string;
+  /** Device label from the active MediaStreamTrack, when the browser exposes it. */
+  deviceLabel?: string;
+  /** Frames received from the capture worklet since start. */
+  frameCount: number;
+  /** Frames produced but discarded because the socket was not writable. */
+  framesDropped: number;
+  /** Date.now() of the most recent capture frame (0 when none yet). */
+  lastFrameAt: number;
+  /** True when frames are arriving recently enough to be considered live audio. */
+  flowing: boolean;
+}
 
 export interface ConversationMessage {
   id: string;
@@ -67,7 +96,11 @@ export interface TurnTimingDiagnostic {
   responseCreatedToFirstDeltaMs?: number;
   firstDeltaToFirstRenderMs?: number;
   speechEndToFirstVisibleTextMs?: number;
+  /** Speech end -> first delta actually painted by the browser (measured render). */
+  speechEndToFirstRenderMs?: number;
   firstDeltaToFinalTextMs?: number;
+  /** Name of the stage that consumed the most time within this turn. */
+  slowestStage?: string;
   status: 'streaming' | 'complete' | 'interrupted';
   transcriptPreview?: string;
 }

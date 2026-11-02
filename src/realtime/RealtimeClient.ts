@@ -1,4 +1,4 @@
-import { MicCapture } from '../audio/capture';
+import { MicCapture, type MicCaptureCallbacks, type MicCaptureLike } from '../audio/capture';
 import { generateFullDiagnosticReport, type ExtendedDiagnosticsData } from './diagnostics';
 import {
   SERVER_EVENTS,
@@ -7,6 +7,7 @@ import {
   inputAudioAppend,
   responseCreate,
   userTextItem,
+  type VadConfig,
 } from './events';
 import type {
   ClientEvent,
@@ -16,6 +17,7 @@ import type {
   ConversationMessage,
   EphemeralTokenInfo,
   LogEntry,
+  MicHealth,
   MicState,
   ServerEvent,
   TurnTimingDiagnostic,
@@ -24,6 +26,9 @@ import type {
 const protocol = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
 const host = typeof window !== 'undefined' ? window.location.host : 'localhost:3000';
 const WS_BASE_URL = `${protocol}//${host}/ws/realtime`;
+
+/** Upper bound on retained raw JSON per log entry (diagnostics stay readable). */
+const MAX_RAW_LOG_CHARS = 2000;
 
 export interface RealtimeClientOptions {
   onStatusChange?: (status: ConnectionStatus) => void;
@@ -35,11 +40,51 @@ export interface RealtimeClientOptions {
   onTokenMinted?: (info: EphemeralTokenInfo) => void;
   onError?: (error: string) => void;
   onClose?: (info: CloseInfo) => void;
-  onMicStateChange?: (state: MicState) => void;
+  onMicStateChange?: (state: MicState, detail?: string) => void;
+  onMicHealth?: (health: MicHealth) => void;
   onMicLevel?: (rms: number) => void;
   onCustomerSpeaking?: (isSpeaking: boolean, itemId?: string, speechDurationMs?: number) => void;
   customInstructions?: string;
+  /** Overrides for VAD endpointing; validated against the provider whitelist. */
+  vadConfig?: Partial<VadConfig>;
+  /** Test seam: substitutes the microphone capture implementation. */
+  micCaptureFactory?: (callbacks: MicCaptureCallbacks) => MicCaptureLike;
 }
+
+/** Receives the render timestamp for a message and reports when it hit the screen. */
+export interface RenderTimestampReport {
+  msgId: string;
+  renderedAtPerf: number;
+}
+
+/**
+ * Identifies which instrumented stage of a turn consumed the most time.
+ *
+ * Honest caveat: the largest single contributor to perceived delay is the VAD
+ * silence window *before* `input_audio_buffer.speech_stopped`, which cannot be
+ * measured from inside the client — our clock starts at speech_stopped. This
+ * helper ranks only the stages we actually observe.
+ */
+export function computeSlowestStage(t: Partial<TurnTimingDiagnostic>): string | undefined {
+  const stages: Array<[string, number | undefined]> = [
+    ['speech-end→committed', t.speechEndToCommittedMs],
+    ['committed→transcription', t.committedToTranscriptionMs],
+    ['speech-end→response-created', t.speechEndToResponseCreatedMs],
+    ['response-created→first-delta', t.responseCreatedToFirstDeltaMs],
+    ['first-delta→render', t.firstDeltaToFirstRenderMs],
+  ];
+
+  let slowest: string | undefined;
+  let max = -1;
+  for (const [label, value] of stages) {
+    if (typeof value === 'number' && Number.isFinite(value) && value > max) {
+      max = value;
+      slowest = label;
+    }
+  }
+  return slowest;
+}
+
 
 export class RealtimeClient {
   private ws: WebSocket | null = null;
@@ -49,8 +94,22 @@ export class RealtimeClient {
   private options: RealtimeClientOptions;
 
   // Microphone capture instance
-  private mic: MicCapture | null = null;
+  private mic: MicCaptureLike | null = null;
   private micState: MicState = 'idle';
+  private micDetail?: string;
+  private micStartPromise: Promise<void> | null = null;
+
+  /**
+   * Monotonic socket generation. Every socket handler captures the epoch current
+   * at creation and ignores itself once a newer socket exists. Without this, a
+   * closing socket's onclose nulls the *new* socket and stops the *new* mic.
+   */
+  private wsEpoch = 0;
+
+  /** Capture frames dropped because the socket was not writable. */
+  private audioFramesDropped = 0;
+  /** Message ids whose render time has already been recorded. */
+  private renderReported = new Set<string>();
 
   // Active assistant turn state
   private activeAssistantMsgId: string | null = null;
@@ -102,6 +161,10 @@ export class RealtimeClient {
   private lastFirstDeltaPerf = 0;
   private lastFirstRenderPerf = 0;
   private lastFinalTextPerf = 0;
+  /** Message id currently awaiting a render report. */
+  private awaitingRenderForMsgId: string | null = null;
+  /** Perf timestamp at which the first delta of this turn was received. */
+  private firstDeltaReceivedAtPerf = 0;
 
   // Bounded Turn Timing History (last 50 turns)
   private turnHistory: TurnTimingDiagnostic[] = [];
@@ -114,6 +177,8 @@ export class RealtimeClient {
     responseCreatedToFirstDeltaMs?: number;
     firstDeltaToFirstRenderMs?: number;
     speechEndToFirstVisibleTextMs?: number;
+    /** Speech end -> first delta actually painted (real render measurement). */
+    speechEndToFirstRenderMs?: number;
     firstDeltaToFinalTextMs?: number;
   } = {};
 
@@ -133,12 +198,62 @@ export class RealtimeClient {
     return this.micState;
   }
 
+  public getMicHealth(): MicHealth {
+    if (this.mic) {
+      return { ...this.mic.getHealth(), framesDropped: this.audioFramesDropped };
+    }
+    return {
+      state: this.micState,
+      detail: this.micDetail,
+      frameCount: 0,
+      framesDropped: this.audioFramesDropped,
+      lastFrameAt: 0,
+      flowing: false,
+    };
+  }
+
   public isMicActive(): boolean {
     return this.micState === 'recording';
   }
 
   public isResponseStreaming(): boolean {
     return this.activeAssistantMsgId !== null;
+  }
+
+  /**
+   * Called by the UI once the first streamed delta of a turn has actually been
+   * painted. This is what makes "first text rendered" a measured value instead of
+   * an assumption: the previous implementation hardcoded this stage to 0 ms.
+   */
+  public markFirstRender(msgId: string, renderedAtPerf?: number): void {
+    if (!msgId || this.renderReported.has(msgId)) return;
+    if (this.awaitingRenderForMsgId && this.awaitingRenderForMsgId !== msgId) return;
+    if (!this.firstDeltaReceivedAtPerf) return;
+
+    const renderedAt =
+      renderedAtPerf ?? (typeof performance !== 'undefined' ? performance.now() : Date.now());
+
+    this.renderReported.add(msgId);
+    if (this.renderReported.size > 200) {
+      // Bound the memo; the ids are only needed for the current turn.
+      const first = this.renderReported.values().next().value;
+      if (first) this.renderReported.delete(first);
+    }
+    this.awaitingRenderForMsgId = null;
+    this.lastFirstRenderPerf = renderedAt;
+
+    const renderLag = Math.max(0, Math.round(renderedAt - this.firstDeltaReceivedAtPerf));
+    this.latestLatencyMetrics.firstDeltaToFirstRenderMs = renderLag;
+    if (this.currentTurnTiming) this.currentTurnTiming.firstDeltaToFirstRenderMs = renderLag;
+
+    if (this.lastSpeechStoppedPerf > 0) {
+      const endToRender = Math.max(0, Math.round(renderedAt - this.lastSpeechStoppedPerf));
+      this.latestLatencyMetrics.speechEndToFirstRenderMs = endToRender;
+      if (this.currentTurnTiming) {
+        this.currentTurnTiming.speechEndToFirstRenderMs = endToRender;
+        this.currentTurnTiming.slowestStage = computeSlowestStage(this.currentTurnTiming);
+      }
+    }
   }
 
   /**
@@ -175,6 +290,8 @@ export class RealtimeClient {
       completedTurns: this.completedTurns,
       reconnectAttempts: 0,
       micState: this.micState,
+      micHealth: this.getMicHealth(),
+      audioFramesDropped: this.audioFramesDropped,
       isResponseStreaming: this.isResponseStreaming(),
       closeInfo: this.closeInfo,
       telemetry: this.getTelemetry(),
@@ -209,6 +326,10 @@ export class RealtimeClient {
     }
   }
 
+  /** Periodic re-emit of mic health so `flowing` degrades to false when frames stop. */
+  private micHealthTimer: NodeJS.Timeout | number | null = null;
+
+  /** Sample buffer occupancy for diagnostics. */
   private startBufferSampling(): void {
     this.stopBufferSampling();
     this.bufferSampleTimer = setInterval(() => {
@@ -279,8 +400,19 @@ export class RealtimeClient {
       this.log('info', 'websocket_connecting', { url: WS_BASE_URL });
       const ws = new WebSocket(WS_BASE_URL, ['realtime', `bai-client-secret.${ephemeralToken}`]);
       this.ws = ws;
+      const epoch = ++this.wsEpoch;
+      const isStale = () => epoch !== this.wsEpoch;
 
       ws.onopen = () => {
+        if (isStale()) {
+          // A newer socket superseded this one while it was opening.
+          try {
+            ws.close(1000, 'Superseded by newer connection');
+          } catch {
+            // ignore
+          }
+          return;
+        }
         this.connecting = false;
         this.connectStartTime = Date.now();
         this.disconnectTime = undefined;
@@ -288,26 +420,35 @@ export class RealtimeClient {
         this.startBufferSampling();
         this.log('info', 'websocket_open', { url: WS_BASE_URL });
 
-        const sessionConfig = buildSessionConfig(this.options.customInstructions);
+        const sessionConfig = buildSessionConfig(this.options.customInstructions, this.options.vadConfig);
         this.send(sessionConfig);
       };
 
       ws.onmessage = (event: MessageEvent) => {
+        if (isStale()) return;
         this.handleServerMessage(event);
       };
 
       ws.onerror = (event: Event) => {
+        if (isStale()) return;
         this.log('info', 'websocket_error', { event });
         this.options.onError?.('WebSocket connection error occurred.');
       };
 
       ws.onclose = (event: CloseEvent) => {
+        // Never let a superseded socket tear down the live session or mic.
+        if (isStale()) {
+          this.log('info', 'stale_socket_close_ignored', { code: event.code });
+          return;
+        }
+
         this.connecting = false;
         this.disconnectTime = Date.now();
         this.stopBufferSampling();
         this.ws = null;
         this.activeAssistantMsgId = null;
         this.activeAssistantText = '';
+        this.awaitingRenderForMsgId = null;
         this.pendingCustomerItemId = null;
 
         void this.stopMic();
@@ -337,78 +478,195 @@ export class RealtimeClient {
     }
   }
 
-  public async startMic(): Promise<void> {
-    if (this.micState === 'recording') return;
+  public disconnect(): void {
+    void this.stopMic();
 
-    if (this.status !== 'connected') {
-      await this.connect();
-      if ((this.status as ConnectionStatus) !== 'connected') {
-        throw new Error('Cannot start microphone: WebSocket is not connected.');
+    const ws = this.ws;
+    // Invalidate this socket generation first, so any late event from it is
+    // treated as stale and can never touch the next session.
+    this.wsEpoch++;
+    this.ws = null;
+    this.connecting = false;
+    this.stopBufferSampling();
+    this.activeAssistantMsgId = null;
+    this.activeAssistantText = '';
+    this.awaitingRenderForMsgId = null;
+    this.pendingCustomerItemId = null;
+
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      this.log('info', 'client_disconnect_requested', {});
+      this.setStatus('closing');
+      try {
+        ws.close(1000, 'User initiated disconnect');
+      } catch {
+        // ignore
       }
     }
 
-    this.micState = 'requesting';
-    this.options.onMicStateChange?.('requesting');
-    this.log('info', 'mic_requesting_permission', {});
+    this.setStatus('disconnected');
+  }
 
-    try {
-      this.mic = new MicCapture(
-        (base64) => {
+  /** Maps a getUserMedia / AudioContext failure onto a precise user-facing state. */
+  private describeMicError(err: any): { state: MicState; message: string } {
+    const name = err?.name || '';
+    if (name === 'NotAllowedError' || name === 'PermissionDeniedError' || name === 'SecurityError') {
+      return {
+        state: 'denied',
+        message:
+          'Microphone permission denied by the browser. Allow microphone access for this site, then press Start again.',
+      };
+    }
+    if (name === 'NotFoundError' || name === 'DevicesNotFoundError' || name === 'OverconstrainedError') {
+      return { state: 'unavailable', message: 'No microphone device was found. Connect a microphone and retry.' };
+    }
+    if (name === 'NotReadableError' || name === 'TrackStartError') {
+      return {
+        state: 'error',
+        message: 'The microphone could not be opened — it may be in use by another application.',
+      };
+    }
+    return {
+      state: 'error',
+      message: err?.message || 'Failed to initialize microphone.',
+    };
+  }
+
+  private setMicState(state: MicState, detail?: string): void {
+    this.micState = state;
+    this.micDetail = detail;
+    this.options.onMicStateChange?.(state, detail);
+    this.emitMicHealth();
+  }
+
+  private emitMicHealth(): void {
+    if (!this.options.onMicHealth) return;
+    const base = this.mic
+      ? this.mic.getHealth()
+      : {
+          state: this.micState,
+          detail: this.micDetail,
+          frameCount: 0,
+          framesDropped: this.audioFramesDropped,
+          lastFrameAt: 0,
+          flowing: false,
+        };
+    this.options.onMicHealth({
+      ...base,
+      state: this.micState,
+      detail: this.micDetail,
+      framesDropped: this.audioFramesDropped,
+    });
+  }
+
+  public async startMic(): Promise<void> {
+    // A start is already in flight: reuse it so rapid double clicks can never
+    // open two capture sessions (duplicate getUserMedia calls / double upload).
+    if (this.micStartPromise) return this.micStartPromise;
+
+    if (this.micState === 'recording') return;
+    if (this.mic && this.mic.active) return;
+
+    const run = async (): Promise<void> => {
+      if (this.status !== 'connected') {
+        await this.connect();
+        if ((this.status as ConnectionStatus) !== 'connected') {
+          throw new Error('Cannot start microphone: WebSocket is not connected.');
+        }
+      }
+
+      // Discard any stale capture instance before building a new one.
+      if (this.mic) {
+        try {
+          await this.mic.stop();
+        } catch {
+          // ignore
+        }
+        this.mic = null;
+      }
+
+      this.setMicState('requesting');
+      this.log('info', 'mic_requesting_permission', {});
+
+      const factory =
+        this.options.micCaptureFactory ??
+        ((callbacks: MicCaptureCallbacks) => new MicCapture(callbacks));
+
+      const capture = factory({
+        onChunk: (base64) => {
           if (this.status === 'connected' && this.ws?.readyState === WebSocket.OPEN) {
             this.send(inputAudioAppend(base64));
+          } else {
+            this.audioFramesDropped++;
           }
         },
-        (rms) => {
-          this.options.onMicLevel?.(rms);
-        }
-      );
+        onLevel: (rms) => this.options.onMicLevel?.(rms),
+        onStateChange: (state, detail) => {
+          // Device loss, system mute and graph failures surface straight through.
+          this.setMicState(state, detail);
+        },
+      });
+      this.mic = capture;
 
-      await this.mic.start();
-      this.micState = 'recording';
-      this.options.onMicStateChange?.('recording');
-      this.log('info', 'mic_streaming_active', { format: 'audio/pcm', rate: 24000 });
-    } catch (err: any) {
-      this.micState = 'error';
-      this.options.onMicStateChange?.('error');
-      this.options.onMicLevel?.(0);
-      const msg = err.name === 'NotAllowedError'
-        ? 'Microphone permission denied by browser. Please allow microphone access.'
-        : err.message || 'Failed to initialize microphone.';
-      this.options.onError?.(msg);
-      this.log('info', 'mic_error', { error: msg });
-    }
+      try {
+        await capture.start();
+        this.setMicState('recording');
+        this.log('info', 'mic_streaming_active', { format: 'audio/pcm', rate: 24000 });
+        this.startMicHealthSampling();
+        this.emitMicHealth();
+      } catch (err: any) {
+        // MicCapture tears itself down on failure; drop our reference too.
+        this.mic = null;
+        const { state, message } = this.describeMicError(err);
+        this.setMicState(state, message);
+        this.options.onMicLevel?.(0);
+        this.options.onError?.(message);
+        this.log('info', 'mic_error', { error: message, state });
+      }
+    };
+
+    this.micStartPromise = run().finally(() => {
+      this.micStartPromise = null;
+    });
+    return this.micStartPromise;
   }
 
   public async stopMic(): Promise<void> {
-    if (!this.mic && this.micState === 'idle') return;
-
-    try {
-      if (this.mic) {
-        await this.mic.stop();
-        this.mic = null;
+    // Wait for an in-flight start so a start/stop race cannot leak a capture.
+    if (this.micStartPromise) {
+      try {
+        await this.micStartPromise;
+      } catch {
+        // ignore
       }
-    } catch (err: any) {
-      this.log('info', 'mic_stop_error', { error: err.message });
     }
 
-    this.micState = 'idle';
-    this.options.onMicStateChange?.('idle');
+    if (!this.mic && this.micState === 'idle') return;
+
+    const capture = this.mic;
+    this.mic = null;
+    this.stopMicHealthSampling();
+
+    try {
+      await capture?.stop();
+    } catch (err: any) {
+      this.log('info', 'mic_stop_error', { error: err?.message });
+    }
+
+    this.setMicState('idle');
     this.options.onMicLevel?.(0);
     this.log('info', 'mic_stopped', {});
   }
 
-  public disconnect(): void {
-    void this.stopMic();
+  private startMicHealthSampling(): void {
+    this.stopMicHealthSampling();
+    this.micHealthTimer = setInterval(() => this.emitMicHealth(), 1000);
+  }
 
-    if (this.ws && (this.status === 'connected' || this.status === 'connecting')) {
-      this.setStatus('closing');
-      this.log('info', 'client_disconnect_requested', {});
-      this.ws.close(1000, 'User initiated disconnect');
-    } else {
-      this.setStatus('disconnected');
+  private stopMicHealthSampling(): void {
+    if (this.micHealthTimer !== null) {
+      clearInterval(this.micHealthTimer as any);
+      this.micHealthTimer = null;
     }
-    this.connecting = false;
-    this.ws = null;
   }
 
   public sendUserText(text: string): boolean {
@@ -488,7 +746,19 @@ export class RealtimeClient {
     this.lastInboundTimestamp = now;
     this.lastInboundType = serverEvent.type;
 
-    this.log('recv', serverEvent.type, serverEvent, event.data as string);
+    const isHighFrequencyDelta =
+      serverEvent.type === SERVER_EVENTS.outputTextDelta ||
+      serverEvent.type === SERVER_EVENTS.textDelta ||
+      serverEvent.type === SERVER_EVENTS.audioTranscriptDelta;
+
+    // Streaming deltas are logged as metadata only: raw JSON per token would churn
+    // the log buffer and re-render the debug drawer on every fragment.
+    this.log(
+      'recv',
+      serverEvent.type,
+      serverEvent,
+      isHighFrequencyDelta ? undefined : (event.data as string)
+    );
 
     switch (serverEvent.type) {
       case SERVER_EVENTS.sessionCreated:
@@ -507,6 +777,9 @@ export class RealtimeClient {
         this.lastSpeechStartedPerf = typeof performance !== 'undefined' ? performance.now() : Date.now();
         this.lastSpeechStoppedPerf = 0;
         this.lastFirstDeltaPerf = 0;
+        this.lastFirstRenderPerf = 0;
+        this.firstDeltaReceivedAtPerf = 0;
+        this.awaitingRenderForMsgId = null;
         this.currentTurnTiming = {
           turnId: itemId,
           itemId,
@@ -645,6 +918,7 @@ export class RealtimeClient {
       case SERVER_EVENTS.audioTranscriptDelta: {
         if (!this.lastFirstDeltaPerf) {
           this.lastFirstDeltaPerf = typeof performance !== 'undefined' ? performance.now() : Date.now();
+          this.firstDeltaReceivedAtPerf = this.lastFirstDeltaPerf;
           if (this.lastResponseCreatedPerf > 0) {
             const respToDelta = Math.round(this.lastFirstDeltaPerf - this.lastResponseCreatedPerf);
             this.latestLatencyMetrics.responseCreatedToFirstDeltaMs = respToDelta;
@@ -655,9 +929,15 @@ export class RealtimeClient {
             this.latestLatencyMetrics.speechEndToFirstVisibleTextMs = totalLatency;
             if (this.currentTurnTiming) this.currentTurnTiming.speechEndToFirstVisibleTextMs = totalLatency;
           }
-          this.lastFirstRenderPerf = this.lastFirstDeltaPerf;
-          this.latestLatencyMetrics.firstDeltaToFirstRenderMs = 0;
-          if (this.currentTurnTiming) this.currentTurnTiming.firstDeltaToFirstRenderMs = 0;
+          // Render latency is NOT known yet: it is reported by the UI once the
+          // delta has actually been painted (see markFirstRender).
+          this.lastFirstRenderPerf = 0;
+          delete this.latestLatencyMetrics.firstDeltaToFirstRenderMs;
+          delete this.latestLatencyMetrics.speechEndToFirstRenderMs;
+          if (this.currentTurnTiming) {
+            delete this.currentTurnTiming.firstDeltaToFirstRenderMs;
+            delete this.currentTurnTiming.speechEndToFirstRenderMs;
+          }
         }
 
         if (!this.lastResponseTimestamps.firstDelta) {
@@ -680,7 +960,14 @@ export class RealtimeClient {
           }
 
           this.activeAssistantText += delta;
-          const currentLatency = this.latestLatencyMetrics.speechEndToFirstVisibleTextMs;
+          // The first delta of this turn is now in flight to the UI; record which
+          // message must report its paint time.
+          if (!this.awaitingRenderForMsgId) {
+            this.awaitingRenderForMsgId = this.activeAssistantMsgId;
+          }
+          const currentLatency =
+            this.latestLatencyMetrics.speechEndToFirstRenderMs ??
+            this.latestLatencyMetrics.speechEndToFirstVisibleTextMs;
           this.options.onMessageDelta?.(
             this.activeAssistantMsgId,
             delta,
@@ -727,6 +1014,7 @@ export class RealtimeClient {
 
         if (this.currentTurnTiming) {
           this.currentTurnTiming.status = 'complete';
+          this.currentTurnTiming.slowestStage = computeSlowestStage(this.currentTurnTiming);
           this.turnHistory.push(this.currentTurnTiming as TurnTimingDiagnostic);
           if (this.turnHistory.length > 50) this.turnHistory.shift();
           this.currentTurnTiming = null;
@@ -784,7 +1072,14 @@ export class RealtimeClient {
       direction,
       type,
       payload,
-      rawJson,
+      // Never retain unbounded raw frames (session.created carries the full
+      // instruction set); the diagnostic report stays readable and memory-bounded.
+      rawJson:
+        rawJson === undefined
+          ? undefined
+          : rawJson.length > MAX_RAW_LOG_CHARS
+          ? `${rawJson.slice(0, MAX_RAW_LOG_CHARS)}…[truncated ${rawJson.length - MAX_RAW_LOG_CHARS} chars]`
+          : rawJson,
     };
 
     if (this.diagnosticLogs.length >= this.maxDiagnosticLogs) {
