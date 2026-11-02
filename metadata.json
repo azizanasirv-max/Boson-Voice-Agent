@@ -1,0 +1,6 @@
+{
+  "name": "Boson AI Higgs Realtime Tester",
+  "description": "Stage 1 testing application for Boson AI Higgs Realtime conversational model with streaming text output.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
