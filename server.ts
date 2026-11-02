@@ -185,6 +185,51 @@ function classifyMessage(data: any, isBinary: boolean): string {
   }
 }
 
+/** Close codes a ws close frame may legally carry (1005/1006/1004/1015 are reserved). */
+const RESERVED_CLOSE_CODES = new Set([1004, 1005, 1006, 1015]);
+
+/**
+ * Maps a received close code onto one that is legal to SEND in a close frame.
+ *
+ * `ws` throws "First argument must be a valid error code number" for reserved
+ * codes. Browsers routinely report 1005 (no status received) when a tab closes or
+ * a socket dies, so forwarding it verbatim would throw inside the close handler
+ * and crash the entire server process, dropping every other live session.
+ */
+export function sanitizeCloseCode(code: number, fallback = 1000): number {
+  if (!Number.isFinite(code)) return fallback;
+  if (code < 1000 || code > 4999) return fallback;
+  if (RESERVED_CLOSE_CODES.has(code)) return fallback;
+  if (code >= 1016 && code <= 2999) return fallback;
+  return code;
+}
+
+/** Close reasons are capped at 123 bytes by the WebSocket spec. */
+export function sanitizeCloseReason(reason: unknown): string {
+  if (typeof reason !== 'string') return '';
+  const truncated = Buffer.from(reason, 'utf8').subarray(0, 123).toString('utf8');
+  // Avoid emitting a broken multi-byte tail after truncation.
+  return truncated.replace(/\uFFFD$/, '');
+}
+
+/**
+ * Chooses which queued frame to discard when the pre-open queue overflows.
+ *
+ * Rules, in priority order:
+ * 1. Never drop the first queued item (the initial session.update / auth handshake).
+ * 2. Prefer dropping the oldest *audio append* — a gap in audio is survivable,
+ *    a missing control event is not.
+ * 3. Never drop from the middle of the queue: splicing audio corrupts the stream.
+ */
+export function selectDropIndex(queue: ReadonlyArray<{ kind: string }>): number {
+  if (queue.length === 0) return -1;
+  if (queue.length === 1) return 0;
+  for (let i = 1; i < queue.length; i++) {
+    if (queue[i].kind === 'input_audio_buffer.append') return i;
+  }
+  return 1;
+}
+
 /**
  * Attaches the Boson realtime WebSocket proxy to an HTTP server.
  * Exported so integration tests exercise the real implementation rather than a copy.
@@ -344,19 +389,15 @@ export function attachRealtimeProxy(server: http.Server): WebSocketServer {
       }
 
       if (bosonWs.readyState === NodeWebSocket.CONNECTING) {
-        // Drop policy: discard the OLDEST audio append, never a control event and
-        // never a frame from the middle of the stream — removing a frame mid-buffer
-        // splices audio and corrupts the utterance the model is listening to.
         if (preOpenQueue.length >= MAX_PREOPEN_QUEUE) {
-          const audioIndex = preOpenQueue.findIndex(
-            (m, i) => i > 0 && m.kind === 'input_audio_buffer.append'
-          );
-          const dropIndex = audioIndex >= 0 ? audioIndex : preOpenQueue.length > 1 ? 1 : 0;
-          preOpenQueue.splice(dropIndex, 1);
-          droppedFrames++;
-          console.warn(
-            `[WebSocket Proxy] Pre-open queue full (${MAX_PREOPEN_QUEUE}); dropped oldest audio frame. Total dropped: ${droppedFrames}`
-          );
+          const dropIndex = selectDropIndex(preOpenQueue);
+          if (dropIndex >= 0) {
+            const [dropped] = preOpenQueue.splice(dropIndex, 1);
+            if (dropped.kind === 'input_audio_buffer.append' || dropped.isBinary) droppedFrames++;
+            console.warn(
+              `[WebSocket Proxy] Pre-open queue full (${MAX_PREOPEN_QUEUE}); dropped oldest "${dropped.kind}" frame. Total audio frames dropped: ${droppedFrames}`
+            );
+          }
         }
         preOpenQueue.push({
           data,
@@ -381,7 +422,8 @@ export function attachRealtimeProxy(server: http.Server): WebSocketServer {
       );
       cleanup();
       if (clientWs.readyState === NodeWebSocket.OPEN) {
-        clientWs.close(code, reason.toString());
+        // Sanitised: 1005/1006 cannot be echoed back in a close frame.
+        clientWs.close(sanitizeCloseCode(code, 1000), sanitizeCloseReason(reason.toString()));
       }
     });
 
@@ -391,7 +433,9 @@ export function attachRealtimeProxy(server: http.Server): WebSocketServer {
       );
       cleanup();
       if (bosonWs.readyState === NodeWebSocket.OPEN || bosonWs.readyState === NodeWebSocket.CONNECTING) {
-        bosonWs.close(code, reason);
+        // Browsers report 1005 (no status) constantly; echoing it would throw and
+        // crash the process, killing every other live session.
+        bosonWs.close(sanitizeCloseCode(code, 1000), sanitizeCloseReason(reason.toString()));
       }
     });
 

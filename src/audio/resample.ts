@@ -49,12 +49,30 @@ export function createLowpass(cutoff: number, sampleRate: number, q = 0.707): Bi
 }
 
 /**
+ * Cascaded 4th-order Butterworth low-pass (two 2nd-order sections with the
+ * standard Butterworth Q pair). A single biquad only gives ~18 dB of rejection at
+ * 18 kHz when downsampling 48k -> 24k, which leaves audible aliasing folding into
+ * ~6 kHz; two sections give ~36 dB. Cost is ~4 multiply-adds per sample, which is
+ * negligible at 48 kHz and adds no buffering latency.
+ */
+export function createCascadeLowpass(cutoff: number, sampleRate: number): Biquad {
+  const first = createLowpass(cutoff, sampleRate, 0.5412);
+  const second = createLowpass(cutoff, sampleRate, 1.3066);
+  return {
+    process(input: Float32Array): Float32Array {
+      return second.process(first.process(input));
+    },
+  };
+}
+
+/**
  * Resamples audio from an input rate to output rate with state preservation between blocks.
  */
 export function createResampler(inputRate: number, outputRate: number): Resampler {
   const ratio = inputRate / outputRate;
   // Anti-aliasing filter applied when downsampling (cutoff at 45% of output rate)
-  const lowpass = ratio > 1 ? createLowpass(outputRate * 0.45, inputRate) : null;
+  const lowpass = ratio > 1 ? createCascadeLowpass(outputRate * 0.45, inputRate) : null;
+
 
   let prev = 0;
   let havePrev = false;
