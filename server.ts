@@ -160,14 +160,43 @@ export function createExpressApp() {
   return app;
 }
 
-async function startServer() {
-  const app = createExpressApp();
-  const server = http.createServer(app);
+/** At most 2 s of 50 ms audio frames may wait for the upstream socket to open. */
+const MAX_PREOPEN_QUEUE = 40;
 
-  // WebSocket proxy server to handle Boson AI keepalive pings robustly
-  const wss = new WebSocketServer({ server, path: '/ws/realtime' });
+/** Ping interval for both legs; browsers answer ping frames automatically. */
+const HEARTBEAT_INTERVAL_MS = 20000;
+
+interface QueuedMessage {
+  data: any;
+  isBinary: boolean;
+  receivedHr: bigint;
+  /** Parsed `type` for text frames, 'binary' for binary frames. */
+  kind: string;
+}
+
+/** Identifies a queued frame without trusting it: used only to choose drop order. */
+function classifyMessage(data: any, isBinary: boolean): string {
+  if (isBinary) return 'binary';
+  try {
+    const parsed = JSON.parse(String(data));
+    return typeof parsed?.type === 'string' ? parsed.type : 'unknown';
+  } catch {
+    return 'unknown';
+  }
+}
+
+/**
+ * Attaches the Boson realtime WebSocket proxy to an HTTP server.
+ * Exported so integration tests exercise the real implementation rather than a copy.
+ */
+export function attachRealtimeProxy(server: http.Server): WebSocketServer {
+  // perMessageDeflate is disabled: permessage-deflate buffers frames before
+  // flushing, which adds latency to every small audio append, and audio is
+  // already encoded compactly.
+  const wss = new WebSocketServer({ server, path: '/ws/realtime', perMessageDeflate: false });
 
   wss.on('connection', (clientWs, req) => {
+
     const maskedRemote = req.socket.remoteAddress || 'unknown';
     console.log('[WebSocket Proxy] Client connected from:', maskedRemote);
 
@@ -201,31 +230,82 @@ async function startServer() {
     const bosonWsUrl = `${BOSON_BASE_URL.replace(/^http/, 'ws')}/v1/realtime?model=higgs-realtime`;
     console.log(`[WebSocket Proxy] Connecting upstream to Boson with token ${maskedToken}`);
 
-    // Bounded FIFO message queue to resolve upstream readiness race
-    const MAX_QUEUE_SIZE = 100;
-    interface QueuedMessage {
-      data: any;
-      isBinary: boolean;
-      receivedHr: bigint;
-    }
+    // Bounded pre-open queue that resolves the upstream readiness race without
+    // ever corrupting the audio stream by removing frames from its middle.
     let preOpenQueue: QueuedMessage[] = [];
     let isUpstreamOpen = false;
     let isSessionClosed = false;
+    let droppedFrames = 0;
+    const forwardedCount = { text: 0 };
     const connStartHr = process.hrtime.bigint();
 
     const bosonWs = new NodeWebSocket(bosonWsUrl, ['realtime', `bai-client-secret.${token}`]);
+
+    let upstreamAlive = true;
+    let clientAlive = true;
+
+    const heartbeat = setInterval(() => {
+      if (isSessionClosed) return;
+
+      if (bosonWs.readyState === NodeWebSocket.OPEN) {
+        if (!upstreamAlive) {
+          console.warn('[WebSocket Proxy] Upstream heartbeat lost; terminating stale socket.');
+          try {
+            bosonWs.terminate();
+          } catch {
+            // ignore
+          }
+          return;
+        }
+        upstreamAlive = false;
+        try {
+          bosonWs.ping();
+        } catch {
+          // ignore
+        }
+      }
+
+      if (clientWs.readyState === NodeWebSocket.OPEN) {
+        if (!clientAlive) {
+          console.warn('[WebSocket Proxy] Client heartbeat lost; terminating stale socket.');
+          try {
+            clientWs.terminate();
+          } catch {
+            // ignore
+          }
+          return;
+        }
+        clientAlive = false;
+        try {
+          clientWs.ping();
+        } catch {
+          // ignore
+        }
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+
+    bosonWs.on('pong', () => {
+      upstreamAlive = true;
+    });
+    clientWs.on('pong', () => {
+      clientAlive = true;
+    });
 
     const cleanup = () => {
       isSessionClosed = true;
       isUpstreamOpen = false;
       preOpenQueue = [];
+      clearInterval(heartbeat);
     };
 
     bosonWs.on('open', () => {
       isUpstreamOpen = true;
+      upstreamAlive = true;
       const upstreamReadyHr = process.hrtime.bigint();
       const connectMs = Number(upstreamReadyHr - connStartHr) / 1e6;
-      console.log(`[WebSocket Proxy] Upstream connection to Boson ready in ${connectMs.toFixed(1)}ms. Flushing ${preOpenQueue.length} queued messages in order.`);
+      console.log(
+        `[WebSocket Proxy] Upstream connection to Boson ready in ${connectMs.toFixed(1)}ms. Flushing ${preOpenQueue.length} queued messages in order.`
+      );
 
       // Flush queued messages in original FIFO order
       while (
@@ -235,6 +315,7 @@ async function startServer() {
         bosonWs.readyState === NodeWebSocket.OPEN
       ) {
         const item = preOpenQueue.shift()!;
+        forwardedCount.text++;
         bosonWs.send(item.data, { binary: item.isBinary }, (err) => {
           if (err) {
             console.error('[WebSocket Proxy] Error during queue flush send:', err.message);
@@ -253,31 +334,51 @@ async function startServer() {
       if (isSessionClosed) return;
 
       if (isUpstreamOpen && bosonWs.readyState === NodeWebSocket.OPEN) {
+        forwardedCount.text++;
         bosonWs.send(data, { binary: isBinary }, (err) => {
           if (err) {
             console.error('[WebSocket Proxy] Error sending message to upstream:', err.message);
           }
         });
-      } else if (bosonWs.readyState === NodeWebSocket.CONNECTING) {
-        // Enforce bounded queue to prevent memory leak
-        if (preOpenQueue.length >= MAX_QUEUE_SIZE) {
-          console.warn(`[WebSocket Proxy] Bounded queue full (${MAX_QUEUE_SIZE}). Evicting oldest non-initial frame.`);
-          // Never drop the initial session.update message (index 0)
-          const dropIndex = preOpenQueue.length > 1 ? 1 : 0;
+        return;
+      }
+
+      if (bosonWs.readyState === NodeWebSocket.CONNECTING) {
+        // Drop policy: discard the OLDEST audio append, never a control event and
+        // never a frame from the middle of the stream — removing a frame mid-buffer
+        // splices audio and corrupts the utterance the model is listening to.
+        if (preOpenQueue.length >= MAX_PREOPEN_QUEUE) {
+          const audioIndex = preOpenQueue.findIndex(
+            (m, i) => i > 0 && m.kind === 'input_audio_buffer.append'
+          );
+          const dropIndex = audioIndex >= 0 ? audioIndex : preOpenQueue.length > 1 ? 1 : 0;
           preOpenQueue.splice(dropIndex, 1);
+          droppedFrames++;
+          console.warn(
+            `[WebSocket Proxy] Pre-open queue full (${MAX_PREOPEN_QUEUE}); dropped oldest audio frame. Total dropped: ${droppedFrames}`
+          );
         }
         preOpenQueue.push({
           data,
           isBinary,
           receivedHr: process.hrtime.bigint(),
+          kind: classifyMessage(data, isBinary),
         });
-      } else {
-        console.warn(`[WebSocket Proxy] Upstream not available (state: ${bosonWs.readyState}). Discarding message safely.`);
+        return;
       }
+
+      if (isBinary || classifyMessage(data, isBinary) === 'input_audio_buffer.append') {
+        droppedFrames++;
+      }
+      console.warn(
+        `[WebSocket Proxy] Upstream not available (state: ${bosonWs.readyState}). Discarding message safely. Total audio frames dropped: ${droppedFrames}`
+      );
     });
 
     bosonWs.on('close', (code, reason) => {
-      console.log(`[WebSocket Proxy] Upstream closed by Boson: code=${code}, reason="${reason.toString()}"`);
+      console.log(
+        `[WebSocket Proxy] Upstream closed by Boson: code=${code}, reason="${reason.toString()}" (forwarded=${forwardedCount.text}, droppedAudioFrames=${droppedFrames})`
+      );
       cleanup();
       if (clientWs.readyState === NodeWebSocket.OPEN) {
         clientWs.close(code, reason.toString());
@@ -285,7 +386,9 @@ async function startServer() {
     });
 
     clientWs.on('close', (code, reason) => {
-      console.log(`[WebSocket Proxy] Client closed: code=${code}, reason="${reason.toString()}"`);
+      console.log(
+        `[WebSocket Proxy] Client closed: code=${code}, reason="${reason.toString()}" (forwarded=${forwardedCount.text}, droppedAudioFrames=${droppedFrames})`
+      );
       cleanup();
       if (bosonWs.readyState === NodeWebSocket.OPEN || bosonWs.readyState === NodeWebSocket.CONNECTING) {
         bosonWs.close(code, reason);
@@ -309,7 +412,17 @@ async function startServer() {
     });
   });
 
+  return wss;
+}
+
+async function startServer() {
+  const app = createExpressApp();
+  const server = http.createServer(app);
+
+  attachRealtimeProxy(server);
+
   if (!isProduction) {
+
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
